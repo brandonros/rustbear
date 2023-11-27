@@ -18,7 +18,9 @@ struct Server {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Debug)
+        .init();
     let config = russh::server::Config {
         inactivity_timeout: Some(std::time::Duration::from_secs(60 * 60)),
         auth_rejection_time: std::time::Duration::from_secs(5),
@@ -59,48 +61,55 @@ impl server::Handler for Server {
         session: Session,
     ) -> Result<(Self, bool, Session), Self::Error> {
         {
-            log::debug!("channel open session");
+            log::debug!("channel_open_session");
             let mut clients = self.clients.lock().await;
             clients.insert((self.id, channel.id()), channel);
         }
         Ok((self, true, session))
     }
 
-    /// The client requests a command.
-    async fn exec_request(
+    async fn env_request(
         self,
-        _channel: ChannelId,
-        _data: &[u8],
+        channel_id: ChannelId,
+        variable_name: &str,
+        variable_value: &str,
         session: Session,
     ) -> Result<(Self, Session), Self::Error> {
+        log::info!("env_request: channel_id = {channel_id} variable_name = {variable_name} variable_value = {variable_value}");
         // TODO
         Ok((self, session))
     }
 
-    /// The client requests a shell.
-    async fn shell_request(
+    async fn exec_request(
         self,
         channel_id: ChannelId,
+        command_bytes: &[u8],
         mut session: Session,
     ) -> Result<(Self, Session), Self::Error> {
-        log::debug!("shell_request");
+        let command = String::from_utf8(command_bytes.to_vec())?;
+        log::info!("exec_request: channel_id = {channel_id} command = {command}");
+
+        // TODO: detect ssh -t vs ssh without -t (allocate pty or not)
 
         // create pty
         let pty = pty_process::Pty::new().unwrap();
         if let Err(e) = pty.resize(pty_process::Size::new(24, 80)) {
             log::error!("pty.resize failed: {:?}", e);
         }
+
         // get pts from pty
         let pts = pty.pts()?;
+
         // split pty into reader + writer
         let (mut pty_reader, pty_writer) = pty.into_split();
+
         // insert pty_reader
         self.channel_pty_writers
             .lock()
             .await
             .insert(channel_id, pty_writer);
 
-        // pty_reader -> session_handle
+        // pty_reader.read() -> session_handle.data()
         let session_handle = session.handle();
         tokio::spawn(async move {
             let mut buffer = vec![0; 1024];
@@ -118,10 +127,76 @@ impl server::Handler for Server {
         });
 
         // Spawn a new /bin/bash process in pty
-        let program = "/bin/bash"; // TODO: get from user's shell?
-        let _child = pty_process::Command::new(program)
+        let mut child = pty_process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg(command)
             .spawn(&pts)
             .map_err(anyhow::Error::new)?;
+
+        // mark request success
+        session.request_success();
+
+        // wait for command to finish
+        let _ = child.wait().await?;
+
+        Ok((self, session))
+    }
+
+    async fn shell_request(
+        self,
+        channel_id: ChannelId,
+        mut session: Session,
+    ) -> Result<(Self, Session), Self::Error> {
+        log::debug!("shell_request channel_id = {channel_id}");
+
+        // create pty
+        let pty = pty_process::Pty::new().unwrap();
+        if let Err(e) = pty.resize(pty_process::Size::new(24, 80)) {
+            log::error!("pty.resize failed: {:?}", e);
+        }
+
+        // get pts from pty
+        let pts = pty.pts()?;
+
+        // split pty into reader + writer
+        let (mut pty_reader, pty_writer) = pty.into_split();
+
+        // insert pty_reader
+        self.channel_pty_writers
+            .lock()
+            .await
+            .insert(channel_id, pty_writer);
+
+        // pty_reader.read() -> session_handle.data()
+        let session_handle = session.handle().clone();
+        tokio::spawn(async move {
+            let mut buffer = vec![0; 1024];
+            while let Ok(size) = pty_reader.read(&mut buffer).await {
+                if size == 0 {
+                    log::info!("pty_reader read 0");
+                    // TODO: kill pty + command?
+                    let _ = session_handle.close(channel_id).await;
+                    break;
+                }
+                let _ = session_handle
+                    .data(channel_id, CryptoVec::from_slice(&buffer[0..size]))
+                    .await;
+            }
+        });
+
+        // Spawn a new /bin/bash process in pty
+        let program = "/bin/bash"; // TODO: get from user's shell?
+        let mut child = pty_process::Command::new(program)
+            .spawn(&pts)
+            .map_err(anyhow::Error::new)?;
+
+        // close session when process exits?
+        let session_handle = session.handle().clone();
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+            // TODO: handle exit code?
+            let _ = session_handle.close(channel_id).await;
+        });
 
         // mark request success
         session.request_success();
@@ -129,7 +204,6 @@ impl server::Handler for Server {
         Ok((self, session))
     }
 
-    /// The client's pseudo-terminal window size has changed.
     async fn window_change_request(
         self,
         channel_id: ChannelId,
@@ -227,7 +301,8 @@ impl server::Handler for Server {
         data: &[u8],
         session: Session,
     ) -> Result<(Self, Session), Self::Error> {
-        // session -> pty_writer
+        // session_handle.data() -> pty_writer.write()
+        log::info!("data channel_id = {channel_id} data = {data:02x?}");
         let mut channel_pty_writers = self.channel_pty_writers.lock().await;
         if let Some(pty_writer) = channel_pty_writers.get_mut(&channel_id) {
             log::info!("pty_writer: data = {data:02x?}");
@@ -237,7 +312,6 @@ impl server::Handler for Server {
                 .map_err(anyhow::Error::new)?;
         }
         drop(channel_pty_writers);
-
         Ok((self, session))
     }
 }
