@@ -9,6 +9,9 @@ use russh_keys::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
+const USERNAME: &str = "test";
+const PASSWORD: &str = "test";
+
 #[derive(Clone)]
 struct Server {
     clients: Arc<Mutex<HashMap<(usize, ChannelId), Channel<Msg>>>>,
@@ -44,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
 impl server::Server for Server {
     type Handler = Self;
     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self {
-        log::debug!("new client");
+        log::info!("new client");
         let s = self.clone();
         self.id += 1;
         s
@@ -61,7 +64,7 @@ impl server::Handler for Server {
         session: Session,
     ) -> Result<(Self, bool, Session), Self::Error> {
         {
-            log::debug!("channel_open_session");
+            log::info!("channel_open_session");
             let mut clients = self.clients.lock().await;
             clients.insert((self.id, channel.id()), channel);
         }
@@ -147,7 +150,7 @@ impl server::Handler for Server {
         channel_id: ChannelId,
         mut session: Session,
     ) -> Result<(Self, Session), Self::Error> {
-        log::debug!("shell_request channel_id = {channel_id}");
+        log::info!("shell_request channel_id = {channel_id}");
 
         // create pty
         let pty = pty_process::Pty::new().unwrap();
@@ -231,8 +234,8 @@ impl server::Handler for Server {
         user: &str,
         public_key: &key::PublicKey,
     ) -> Result<(Self, Auth), Self::Error> {
-        log::debug!("auth_publickey: user: {user} public_key: {public_key:?}");
-        let public_key_is_valid = true; // TODO
+        log::info!("auth_publickey: user: {user} public_key: {}", public_key.public_key_base64());
+        let public_key_is_valid = false; // TODO
         if public_key_is_valid {
             Ok((self, server::Auth::Accept))
         } else {
@@ -251,7 +254,7 @@ impl server::Handler for Server {
         submethods: &str,
         _response: Option<Response<'async_trait>>,
     ) -> Result<(Self, Auth), Self::Error> {
-        log::debug!("auth_keyboard_interactive: user: {user} submethods: {submethods}");
+        log::info!("auth_keyboard_interactive: user: {user} submethods: {submethods}");
         Ok((
             self,
             Auth::Reject {
@@ -261,7 +264,7 @@ impl server::Handler for Server {
     }
 
     async fn auth_none(self, user: &str) -> Result<(Self, Auth), Self::Error> {
-        log::debug!("auth_none: user: {user}");
+        log::info!("auth_none: user: {user}");
         Ok((
             self,
             Auth::Reject {
@@ -271,8 +274,8 @@ impl server::Handler for Server {
     }
 
     async fn auth_password(self, user: &str, password: &str) -> Result<(Self, Auth), Self::Error> {
-        log::debug!("auth_password: credentials: {}, {}", user, password);
-        let password_is_valid = true; // TODO
+        log::info!("auth_password: credentials: {}, {}", user, password);
+        let password_is_valid = user == USERNAME && password == PASSWORD;
         if password_is_valid {
             Ok((self, Auth::Accept))
         } else {
